@@ -226,7 +226,7 @@ class TerritoryEvaluation(BaseMethod):
         results = []
         for _, territory in gdf_territory.iterrows():
             buffer = territory.geometry.buffer(radius_m)
-            towns_in_buffer = gpd.sjoin(towns_gdf, gpd.GeoDataFrame(geometry=[buffer], crs=towns_gdf.crs), op='intersects')
+            towns_in_buffer = gpd.sjoin(towns_gdf, gpd.GeoDataFrame(geometry=[buffer], crs=towns_gdf.crs), predicate='intersects')
 
             if not towns_in_buffer.empty:
                 total_population = towns_in_buffer['population'].sum()
