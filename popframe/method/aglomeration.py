@@ -1,6 +1,9 @@
 from .base_method import BaseMethod
 import geopandas as gpd
 from shapely.geometry import Point, Polygon, MultiPolygon
+from popframe.preprocessing.level_filler import LevelFiller
+import pandas as pd
+from shapely.ops import unary_union
 
 RADIUS = 500
 MIN_POPULATION = 15000
@@ -40,7 +43,7 @@ class AgglomerationBuilder(BaseMethod):
                 if node in IN_AGGLOMERATION or population < MIN_POPULATION:
                     continue
 
-                agglomeration = self._get_agglomeration_around_node(node, max_time)
+                agglomeration = self._get_agglomeration_around_node(node, max_time, towns)
 
                 if agglomeration:
                     agglomeration["name"] = node_names.get(node)
@@ -60,7 +63,7 @@ class AgglomerationBuilder(BaseMethod):
 
         return agglomeration_gdf
 
-    def _get_agglomeration_around_node(self, start_node, max_time):
+    def _get_agglomeration_around_node(self, start_node, max_time, towns):
         """
         Finds the agglomeration around a given city node within the specified time limit using the accessibility matrix.
         
@@ -80,7 +83,7 @@ class AgglomerationBuilder(BaseMethod):
         if within_time_nodes.empty:
             return None
 
-        nodes_data = self.region.get_towns_gdf().set_index('id').loc[within_time_nodes]
+        nodes_data = towns.set_index('id').loc[within_time_nodes]
         nodes_data['geometry'] = nodes_data.apply(lambda row: Point(row['geometry'].x, row['geometry'].y), axis=1)
         nodes_gdf = gpd.GeoDataFrame(nodes_data, geometry='geometry', crs=self.region.crs)
 
@@ -103,41 +106,74 @@ class AgglomerationBuilder(BaseMethod):
         - towns: GeoDataFrame of the towns.
         
         Returns:
-        - A GeoDataFrame of the merged agglomerations with updated population data.
+        - A GeoDataFrame of the merged agglomerations with updated population data and agglomeration level.
         """
         merged_geometries = []
         processed_indices = set()
 
+        # Основной цикл по агломерациям
         for i, row_i in gdf.iterrows():
             if i in processed_indices:
                 continue
-            
+
             overlapping_agglomerations = [row_i]
             geometry = row_i['geometry']
             merged_names = {row_i['name']}
 
+            # Первый цикл: проверка пересечений и объединение агломераций
             for j, row_j in gdf.iterrows():
                 if i != j and j not in processed_indices:
                     if geometry.intersects(row_j['geometry']):
                         overlapping_agglomerations.append(row_j)
-                        geometry = geometry.union(row_j['geometry'])
+                        geometry = unary_union([geometry, row_j['geometry']])  # Используем unary_union
                         merged_names.add(row_j['name'])
                         processed_indices.add(j)
 
+            # Второй цикл: дополнительная проверка для объединения с новыми полигонами
+            still_intersecting = True
+            while still_intersecting:
+                still_intersecting = False
+                for j, row_j in gdf.iterrows():
+                    if j not in processed_indices:
+                        if geometry.intersects(row_j['geometry']):
+                            overlapping_agglomerations.append(row_j)
+                            geometry = unary_union([geometry, row_j['geometry']])  # Используем unary_union
+                            merged_names.add(row_j['name'])
+                            processed_indices.add(j)
+                            still_intersecting = True
+
+            # Проверяем валидность геометрии и исправляем ее, если необходимо
+            if not geometry.is_valid:
+                geometry = geometry.buffer(0)
+
             towns_in_agglomeration = towns[towns.intersects(geometry)]
             population_from_towns = towns_in_agglomeration['population'].sum()
+
+            # Определение уровня агломерации на основе населения
+            if population_from_towns <= 250000:
+                agglomeration_level = 1
+            elif population_from_towns <= 500000:
+                agglomeration_level = 2
+            elif population_from_towns <= 1000000:
+                agglomeration_level = 3
+            elif population_from_towns <= 5000000:
+                agglomeration_level = 4
+            else:
+                agglomeration_level = 5
 
             merged_agglomeration = {
                 'geometry': geometry,
                 'type': 'Polycentric' if len(overlapping_agglomerations) > 1 else 'Monocentric',
                 'core_cities': ', '.join(merged_names),
-                'population': population_from_towns
+                'population': population_from_towns,
+                'agglomeration_level': agglomeration_level
             }
             merged_geometries.append(merged_agglomeration)
 
             processed_indices.add(i)
 
         return gpd.GeoDataFrame(merged_geometries, crs=gdf.crs)
+
 
     def _simplify_multipolygons(self, gdf):
         """
@@ -153,81 +189,77 @@ class AgglomerationBuilder(BaseMethod):
             lambda geom: max(geom.geoms, key=lambda g: g.area) if isinstance(geom, MultiPolygon) else geom
         )
         return gdf
-    
+
+
     def evaluate_city_agglomeration_status(self, towns, agglomeration_gdf):
         """
         Evaluates cities according to their position in the agglomeration.
-                
-        Adds the 'agglomeration_status' attribute to towns with possible values:
-        - 'Outside the agglomeration'
-        - 'In the agglomeration of a larger city'
-        - 'Agglomeration Center'
+        
+        Adds the 'agglomeration_status' and 'agglomeration_level' attributes to towns:
+        - 'agglomeration_status': 'Outside the agglomeration', 'Agglomeration Center', 'In the agglomeration'.
+        - 'agglomeration_level': 0 for cities outside agglomerations, and agglomeration level (1 to 5) for cities within agglomerations.
         
         Parameters:
-        - - towns: Getdataframe with cities.
-        - - agglomeration_gdf: Geo Data Frame with agglomerations.
+        - towns: GeoDataFrame with cities.
+        - agglomeration_gdf: GeoDataFrame with agglomerations.
         
         Returns:
-        - - towns: Updated Getdataframe with added 'agglomeration_status' attribute.
+        - Updated GeoDataFrame with added 'agglomeration_status' (str) and 'agglomeration_level' (int) attributes.
         """
         agglomeration_status = []
+        agglomeration_level = []
 
         for idx, town in towns.iterrows():
             town_point = town['geometry']
             town_name = town['name']
-            town_population = town['population']
-
+            
             in_agglomeration = False
-            in_larger_agglomeration = False
             is_core_city = False
+            current_agglomeration_level = 0  # Default level for towns outside agglomerations
 
             for agg_idx, agg in agglomeration_gdf.iterrows():
                 if town_point.intersects(agg['geometry']):
                     in_agglomeration = True
+                    current_agglomeration_level = agg['agglomeration_level']
 
                     # Проверяем, является ли город основным в агломерации
                     core_cities = agg['core_cities'].split(', ')
                     if town_name in core_cities:
                         is_core_city = True
+                        current_status = 'Центр агломерации'
                         break
-
-                    # Проверяем, есть ли в агломерации города более крупного уровня
-                    for core_city in core_cities:
-                        core_city_pop = towns[towns['name'] == core_city]['population'].values[0]
-                        if core_city_pop > town_population:
-                            in_larger_agglomeration = True
-                            break
 
             if is_core_city:
                 agglomeration_status.append('Центр агломерации')
+                agglomeration_level.append(current_agglomeration_level)
             elif not in_agglomeration:
                 agglomeration_status.append('Вне агломерации')
-            elif in_larger_agglomeration:
-                agglomeration_status.append('В агломерации более крупного города')
+                agglomeration_level.append(0)  # 0 for cities outside agglomerations
             else:
                 agglomeration_status.append('В агломерации')
+                agglomeration_level.append(current_agglomeration_level)
 
         towns['agglomeration_status'] = agglomeration_status
+        towns['agglomeration_level'] = agglomeration_level
         return towns
 
-    def get_agglomerations(self):
+
+    def get_agglomerations(self, update_df: pd.DataFrame | None = None):
         """
         The main function that orchestrates the creation, merging, and finalization of agglomerations.
         
         Returns:
         - A GeoDataFrame with the finalized agglomerations, merged, simplified, and overlaid on region boundaries.
         """
-        towns = self.region.get_towns_gdf()
-        # Ensure that the towns GeoDataFrame has a geometry column set
-        if 'geometry' not in towns.columns:
-            raise ValueError("Towns GeoDataFrame must have a 'geometry' column with valid geometries.")
-        
-        towns = towns.set_geometry('geometry')
+        # towns = self._get_towns_gdf(update_df)
+        towns = self.region.get_update_towns_gdf(update_df)
+
         region_boundary = self.region.region
 
         # Step 1: Build agglomerations
         agglomeration_gdf = self._build_agglomeration(towns)
-
+                # Step 4: Simplify multipolygons
+        agglomeration_gdf = self._simplify_multipolygons(agglomeration_gdf)
         # Step 2: Merge intersecting agglomerations and update population data
         agglomeration_gdf = self._merge_intersecting_agglomerations(agglomeration_gdf, towns)
 
