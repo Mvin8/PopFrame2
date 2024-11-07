@@ -163,7 +163,7 @@ class AgglomerationBuilder(BaseMethod):
 
             merged_agglomeration = {
                 'geometry': geometry,
-                'type': 'Polycentric' if len(overlapping_agglomerations) > 1 else 'Monocentric',
+                'type': 'Polycentric' if len(merged_names) > 1 else 'Monocentric',
                 'core_cities': ', '.join(merged_names),
                 'population': population_from_towns,
                 'agglomeration_level': agglomeration_level
