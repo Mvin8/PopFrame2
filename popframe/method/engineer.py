@@ -51,4 +51,4 @@ class InfrastructureAnalyzer:
     def get_results(self) -> gpd.GeoDataFrame:
         """Returns the result with columns 'id', 'score', 'types_in_radius', and 'geometry' in CRS 4326."""
         # Convert back to CRS 4326 before returning
-        return self.assessment_areas_gdf[['id', 'score', 'types_in_radius', 'geometry']].to_crs(epsg=4326)
+        return self.assessment_areas_gdf[['score', 'types_in_radius', 'geometry']].to_crs(epsg=4326)
